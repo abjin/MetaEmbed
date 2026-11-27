@@ -11,7 +11,8 @@ MetaEmbed를 문서 이미지 검색(VDR) 데이터만으로 학습하고, 쿼�
 | MMR 그룹 | `[16,1] [16,4] [16,8] [16,16] [16,64]` (쿼리 16 고정, 문서 1/4/8/16/64) |
 | 모델 | Qwen2.5-VL-3B / 7B-Instruct + processor `vidore/colqwen2.5-base`, Meta Token 16/64, dim -1 |
 | LoRA | r 32, alpha 32, dropout 0.1, LLM의 attention/MLP proj만 (transformers 4.51.3 기준 7B 81.0M = 0.97%) |
-| 최적화 | lr 1e-4, warmup 40 step, τ 0.03, `do_gather: true` (전 GPU 배치를 negative로 사용) |
+| 최적화 | lr 1e-4, warmup 40 step, τ 0.03, `do_gather: true` (전 GPU의 positive를 negative로 사용) |
+| 쿼리당 후보 | 321개 = 전체 배치의 positive 320 + 자기 hard negative 1 (hard negative는 gather하지 않음, `contrastive_trainer_v2.py:184`) |
 | 배치 | 전체 320, 1 epoch = 750 step. 3B: GPU 4장(4–7번) × 80 / 7B: GPU 5장(3–7번) × 64 |
 | 평가 | 150 step마다 ViDoRe v1 10개(`mteb/*_beir`) + v2 4개(`vidore/*_v2`), MMEB 끔 |
 
@@ -20,6 +21,8 @@ MetaEmbed를 문서 이미지 검색(VDR) 데이터만으로 학습하고, 쿼�
 ## 파일
 
 - `scripts/7b_mrl_vdr.yaml`, `scripts/3b_mrl_vdr.yaml`: 학습 설정 (베이스 모델, 출력 폴더, 장당 배치만 다름)
+- `scripts/3b_mrl_vdr_mixed.yaml`: 3B + 혼합 토큰 수 로스 (아래 "혼합 토큰 수 로스")
+- `scripts/3b_mrl_vdr_evalmixed.yaml` + `scripts/eval/eval_checkpoints.py`: 학습이 끝난 체크포인트를 평가만 다시 돌림
 - `scripts/vdr_data_ratios.yaml`: 학습 subset과 비율
 - `scripts/data/prepare_moca_vdr.py`: MoCa parquet → 학습 로더 형식 변환
 - `scripts/data/test_data_vidore_beir_hf.yaml`, `scripts/data/test_data_vidore_v2_hf.yaml`: HF id 기반 평가셋
@@ -70,6 +73,26 @@ GPUS=4,5,6,7 FSDP_CONFIG=fsdp_4gpu.yaml scripts/train/run_vdr.sh scripts/3b_mrl_
   3번은 다른 사용자가 쓰는 0–2번과 스위치를 나눠 쓴다. 3–7번 5장으로 돌린 두 번(7B, 3B) 모두 step당 시간이
   2–5배로 늘어나는 구간이 나왔고(GPU 사용률은 100%, 통신 대기로 추정), 4–7번 4장에서는 나오지 않았다.
 
+## 혼합 토큰 수 로스 (`ColbertInBatchNegativeMixedBudgetLoss`)
+
+기존 MMR은 그룹 하나 안에서 모든 후보 문서가 같은 토큰 수를 쓴다. 그래서 토큰 수가 서로 다른 문서끼리 점수를 비교할 수 있는지는
+학습하지 않는다(문서마다 토큰 수를 다르게 색인하는 경우).
+새 로스는 매 step **후보 문서마다** 토큰 수 r_c를 {1,4,8,16,64}에서 균등하게 독립적으로 뽑는다. positive와 hard negative 모두 해당한다.
+쿼리 16토큰과 각 후보의 앞 r_c개 토큰으로 MaxSim 점수를 계산하고, 같은 321개 후보에 InfoNCE를 건다.
+
+- 같은 문서는 모든 GPU에서 같은 r_c를 쓴다. gather된 positive는 GPU마다 같은 문서라서, (seed, 호출 횟수)로 시드한 생성기로 뽑는다. hard negative는 GPU별로 따로 뽑는다.
+- r_c 뒤의 토큰은 -inf로 가려 max에서 뺀다. 0으로 채우면 음수 MaxSim이 0으로 바뀐다.
+- 결합 방식(`mixed_budget_mode`)
+  - `add`: MMR 평균 + w·L_mixed (기본, w=1.0)
+  - `group`: (Σ MMR + w·L_mixed) / 6
+- 로그 키는 `mixed_budget_16`이다.
+- 평가에는 `mrl_16_mixed` 그룹이 추가된다. 문서 i마다 고정 seed(0)로 r_i를 뽑아 색인한 nDCG 등이다.
+  - 모든 모델과 체크포인트가 같은 배정을 쓴다.
+  - 스코어러가 0으로 패딩하는 문제는, 앞 r_i개 토큰 중 마지막 토큰을 반복해 길이를 맞추는 방식으로 피했다(MaxSim 값이 그대로다).
+- 기준 모델에는 `scripts/eval/eval_checkpoints.py`로 같은 그룹을 사후 평가한다(GPU 1장).
+  - 같은 체크포인트를 GPU 4장으로 학습 중에 평가한 값과 tabfquad nDCG@5가 최대 0.01 차이 난다(bf16, 배치 구성 차이로 추정).
+  - 그래서 두 모델 비교는 같은 스크립트로 잰 값끼리 한다.
+
 ## 실행 기록 (rpower4, A100 80GB)
 
 | 날짜 | 실행 | 결과 |
@@ -80,7 +103,10 @@ GPUS=4,5,6,7 FSDP_CONFIG=fsdp_4gpu.yaml scripts/train/run_vdr.sh scripts/3b_mrl_
 | 2026-11-27 | 3B, GPU 5장 × 64, 20 step 테스트 | 31초/step(16–20 step은 120–140초로 느려짐), 메모리 41.4GB. step 20 tabfquad nDCG@5: 1토큰 0.567 / 4: 0.579 / 8: 0.590 / 16: 0.576 / 64: 0.544 |
 | 2026-11-27 | 3B, GPU 4장(4–7) × 80, 본 학습 | 28 step에서 중단: 0바이트 이미지(`colpali_tevatron/colpali_96.jpg`) 디코딩 실패. 35.5초/step, 메모리 50.8GB |
 | 2026-11-27 | 3B, 데이터 재생성 후 재시작 | 3 step에서 중단: HF datasets 캐시에 남은 예전 데이터를 읽고 있었음 |
-| 2026-11-27 | 3B, GPU 4장(4–7) × 80, 본 학습 (캐시 삭제 후 재시작) | 진행 중 |
+| 2026-11-27 | 3B, GPU 4장(4–7) × 80, 본 학습 (캐시 삭제 후 재시작) | 진행 중. step 150 nDCG@5 v1 평균: 1토큰 0.778 / 4: 0.788 / 8: 0.799 / 16: 0.814 / 64: 0.825, v2 평균: 0.463 / 0.469 / 0.471 / 0.480 / 0.479. 평가 1회 약 30분 |
+| 2026-11-27 | 3B + 혼합 토큰 수 로스, GPU 3번 1장 × 16, 5 step 테스트 | 정상. `mixed_budget_16`, `mrl_16_mixed` 확인 |
+| 2026-11-27 | 기준 checkpoint-150, `eval_checkpoints.py` 테스트(tabfquad) | nDCG@5 1토큰 0.854 / 4: 0.853 / 8: 0.864 / 16: 0.884 / 64: 0.883 / 혼합 0.851 |
+| 예정 | 3B + 혼합 토큰 수 로스 본 학습 (`add`, w=1.0) | 기준 학습이 끝나면 자동 시작. 기준 체크포인트 혼합 평가는 GPU 3번에서 동시 진행 |
 
-초반에는 MMR 그룹 5개의 loss가 거의 같게 움직인다. 학습이 진행되면서 문서 64토큰 그룹이 1토큰 그룹보다
-앞서는지(Meta Token이 실제로 다른 정보를 나눠 담는지)를 계속 확인해야 한다.
+초반에는 MMR 그룹 5개의 loss가 거의 같게 움직였지만, step 150 평가에서는 토큰 수가 늘수록 nDCG가 꾸준히 올랐다(v1 평균 0.778 → 0.825).
+Meta Token들이 서로 다른 정보를 나눠 담고 있다는 뜻으로 보인다. 다국어 v2에서는 차이가 작다.

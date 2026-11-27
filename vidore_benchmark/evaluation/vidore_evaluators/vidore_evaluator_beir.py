@@ -19,6 +19,31 @@ except ImportError:  # bm25_retriever is not shipped in this repo
     BM25Retriever = ()  # isinstance(x, ()) is always False
 
 
+def mixed_budget_passages(
+    passage_embeddings: List[torch.Tensor], choices: List[int], seed: int = 0
+) -> List[torch.Tensor]:
+    """
+    Keep a different number of tokens per passage: passage i keeps its first r_i tokens,
+    with r_i drawn uniformly from `choices` by a fixed-seed generator, so every model and
+    checkpoint sees the same assignment.
+
+    The scorers pad passages with zero vectors, which would add a 0 to the MaxSim max, so
+    instead each passage is filled back to its full length by repeating its last kept
+    token. Repeated tokens do not change the max, so the score equals MaxSim over the
+    first r_i tokens exactly.
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    choices_t = torch.tensor([int(c) for c in choices])
+    budgets = choices_t[torch.randint(len(choices_t), (len(passage_embeddings),), generator=gen)]
+    out = []
+    for emb, r in zip(passage_embeddings, budgets.tolist()):
+        keep = min(r, emb.size(0))
+        idx = torch.arange(emb.size(0), device=emb.device).clamp(max=keep - 1)
+        out.append(emb[idx])
+    return out
+
+
 class BEIRDataset(TypedDict):
     """
     BEIR dataset type. A BEIR dataset must contain 3 subsets:
@@ -206,19 +231,27 @@ class ViDoReEvaluatorBEIR(BaseViDoReEvaluator):
             return metrics
         else:
             all_metrics = dict()
+            last_fixed_metrics = None
             for i, (num_query_token, num_passage_token) in enumerate(mrl_groups):
                 rank0_print(
                     f"Start at {datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S')} for MRL {num_query_token}-{num_passage_token} score processing..."
                 )
+                if isinstance(num_passage_token, (list, tuple)):
+                    # mixed budgets: every passage keeps its own number of tokens
+                    group_name = f"mrl_{num_query_token}_mixed"
+                    passages = mixed_budget_passages(passage_embeddings, num_passage_token)
+                else:
+                    group_name = f"mrl_{num_query_token}_{num_passage_token}"
+                    passages = [
+                        passage_emb[:num_passage_token]
+                        for passage_emb in passage_embeddings
+                    ]
                 # Get the similarity scores
                 scores = self.vision_retriever.get_scores(
                     query_embeddings=[
                         query_emb[:num_query_token] for query_emb in query_embeddings
                     ],
-                    passage_embeddings=[
-                        passage_emb[:num_passage_token]
-                        for passage_emb in passage_embeddings
-                    ],
+                    passage_embeddings=passages,
                     batch_size=batch_score,
                 )
                 # Get the relevant passages and results
@@ -235,11 +268,13 @@ class ViDoReEvaluatorBEIR(BaseViDoReEvaluator):
                     ignore_identical_ids=False,
                 )
 
-                all_metrics[f"mrl_{num_query_token}_{num_passage_token}"] = metrics
-                if i == len(mrl_groups) - 1:
-                    # use the last one as the final metrics -- avoid crashing the out-loop
-                    all_metrics.update(metrics)
+                all_metrics[group_name] = metrics
+                if not group_name.endswith("_mixed"):
+                    last_fixed_metrics = metrics
 
+            # use the last fixed-budget group as the final metrics -- avoid crashing the
+            # out-loop (a trailing mixed-budget group does not replace it)
+            all_metrics.update(last_fixed_metrics if last_fixed_metrics is not None else metrics)
             return all_metrics
 
     def _get_retrieval_results(

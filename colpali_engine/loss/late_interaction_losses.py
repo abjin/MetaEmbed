@@ -379,6 +379,132 @@ class ColbertInBatchNegativeLoss(ColbertModule):
         return loss if not loss_stats else (loss, loss_stats)
 
 
+class ColbertInBatchNegativeMixedBudgetLoss(ColbertInBatchNegativeLoss):
+    """
+    MMR loss of ColbertInBatchNegativeLoss plus a mixed-budget InfoNCE term.
+
+    Every step, each candidate document c (every gathered positive and every local hard
+    negative) independently draws a doc token budget r_c from `mixed_budget_choices`, and is
+    scored with its first r_c Meta Tokens against the query's first
+    `mixed_budget_query_tokens` tokens. Candidates in one softmax therefore have different
+    budgets, which trains scores to stay comparable across budgets (an index where each
+    document keeps a different number of tokens).
+
+    A gathered positive column is the same document on every rank, so its r_c must match
+    across ranks: it is drawn from a CPU generator seeded with (seed, call count). Every
+    rank calls forward the same number of times, so no communication is needed. Hard
+    negatives are rank-local and use a rank-dependent seed.
+
+    Args:
+        mixed_budget_choices: doc budgets r_c is drawn from, uniformly.
+        mixed_budget_query_tokens: query tokens used by the mixed term.
+        mixed_budget_mode: "add" -> mean(MMR losses) + w * L_mixed;
+            "group" -> (sum_k w_k * L_k + w * L_mixed) / (num_groups + 1).
+        mixed_budget_weight: w above.
+        mixed_budget_seed: base seed of the r_c draws.
+    """
+
+    def __init__(
+        self,
+        *args,
+        mixed_budget_choices: List[int] = (1, 4, 8, 16, 64),
+        mixed_budget_query_tokens: int = 16,
+        mixed_budget_mode: str = "add",
+        mixed_budget_weight: float = 1.0,
+        mixed_budget_seed: int = 0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        assert self.mrl_groups is not None, "mixed-budget loss is defined on top of mrl_groups"
+        assert mixed_budget_mode in ("add", "group"), mixed_budget_mode
+        assert not self.normalize_scores, "normalize_scores is unsupported (see ColbertModule)"
+        self.mixed_budget_choices = [int(c) for c in mixed_budget_choices]
+        self.mixed_budget_query_tokens = mixed_budget_query_tokens
+        self.mixed_budget_mode = mixed_budget_mode
+        self.mixed_budget_weight = mixed_budget_weight
+        self.mixed_budget_seed = mixed_budget_seed
+        self._num_calls = 0
+        rank0_print(
+            f"Using mixed-budget loss: choices={self.mixed_budget_choices}, "
+            f"query_tokens={mixed_budget_query_tokens}, mode={mixed_budget_mode}, "
+            f"weight={mixed_budget_weight}"
+        )
+
+    def _draw_budgets(self, num: int, seed: int, device: torch.device) -> torch.Tensor:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed)
+        choices = torch.tensor(self.mixed_budget_choices)
+        idx = torch.randint(len(choices), (num,), generator=gen)
+        return choices[idx].to(device)
+
+    @staticmethod
+    def _masked_scores(raw: torch.Tensor, budgets: torch.Tensor) -> torch.Tensor:
+        # raw: [B, C, Nq, Nd]; budgets: [C]. Doc tokens at index >= r_c are excluded from
+        # the max with -inf (zero-filling would wrongly clamp negative MaxSim values to 0).
+        tok = torch.arange(raw.size(3), device=raw.device)
+        mask = tok[None, :] >= budgets[:, None]  # [C, Nd]
+        masked = raw.masked_fill(mask[None, :, None, :], float("-inf"))
+        return masked.amax(dim=3).sum(dim=2)  # [B, C]
+
+    def _ce_from_scores(self, pos_scores, neg_scores, offset):
+        # same as the tail of ColbertInBatchNegativeLoss.get_sub_loss_by_raw
+        batch_size = pos_scores.size(0)
+        _, pos_idx = self._get_idx(batch_size, offset, pos_scores.device)
+        if self.pos_aware_negative_filtering:
+            self._filter_high_negatives(pos_scores, pos_idx)
+        neg_ratio = neg_scores.size(1) // neg_scores.size(0)
+        arange = torch.arange(batch_size, device=neg_scores.device)
+        neg_selected = neg_scores.view(batch_size, batch_size, neg_ratio)[arange, arange]
+        scores = torch.cat([pos_scores, neg_selected], dim=1)
+        return self.ce_loss(scores / self.temperature, pos_idx)
+
+    def mixed_budget_loss(self, raw, neg_raw, offset=0):
+        call = self._num_calls
+        self._num_calls += 1
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        nq = self.mixed_budget_query_tokens
+        step_seed = self.mixed_budget_seed * 1_000_003 + call
+        # shared across ranks: gathered positives are the same documents everywhere
+        pos_budgets = self._draw_budgets(raw.size(1), step_seed, raw.device)
+        # rank-local hard negatives get their own stream per rank
+        neg_budgets = self._draw_budgets(
+            neg_raw.size(1), (step_seed << 8) + rank + 1, neg_raw.device
+        )
+        pos_scores = self._masked_scores(raw[:, :, :nq], pos_budgets)
+        neg_scores = self._masked_scores(neg_raw[:, :, :nq], neg_budgets)
+        return self._ce_from_scores(pos_scores, neg_scores, offset)
+
+    def forward(
+        self,
+        query_embeddings: torch.Tensor,
+        doc_embeddings: torch.Tensor,
+        neg_doc_embeddings: torch.Tensor,
+        offset: int = 0,
+    ):
+        loss_stats = {}
+        weighted_sum = 0.0
+        raw, neg_raw = self.get_raw_scores(
+            query_embeddings, doc_embeddings, neg_doc_embeddings
+        )
+        for num_query_tokens, num_doc_tokens, weight in self.mrl_groups:
+            sub_raw = raw[:, :, :num_query_tokens, :num_doc_tokens]
+            neg_sub_raw = neg_raw[:, :, :num_query_tokens, :num_doc_tokens]
+            lengths = (query_embeddings[:, :num_query_tokens, 0] != 0).sum(dim=1)
+            subloss = self.get_sub_loss_by_raw(sub_raw, neg_sub_raw, lengths, offset)
+            weighted_sum = weighted_sum + subloss * weight
+            loss_stats[f"mrl_negce_{num_query_tokens}_{num_doc_tokens}_{weight}"] = subloss
+
+        mixed = self.mixed_budget_loss(raw, neg_raw, offset)
+        loss_stats[f"mixed_budget_{self.mixed_budget_query_tokens}"] = mixed
+
+        n = len(self.mrl_groups)
+        if self.mixed_budget_mode == "add":
+            loss = weighted_sum / n + self.mixed_budget_weight * mixed
+        else:  # "group"
+            loss = (weighted_sum + self.mixed_budget_weight * mixed) / (n + 1)
+        return loss, loss_stats
+
+
 # THIS is not aligned with MoCa -- as it additionally encourage the positive one more time
 # still is should worth a try
 class NewColbertNegativeCELoss(ColbertModule):

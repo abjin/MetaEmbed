@@ -258,9 +258,9 @@ class ColModelTrainingConfig:
     do_padding: Optional[bool] = (
         False  # True when using split-XX pooler, controls both training & eval
     )
-    eval_mrl_groups: Optional[List[Tuple[int, int]]] = (
-        None  # provide to override training-time MRL groups
-    )
+    # provide to override training-time MRL groups; a doc entry that is a list of budgets,
+    # e.g. [16, [1, 4, 8, 16, 64]], evaluates a mixed-budget index (reported as mrl_16_mixed)
+    eval_mrl_groups: Optional[List[Tuple[int, Union[int, List[int]]]]] = None
 
     """
     Config class used for training a ColVision model.
@@ -394,6 +394,14 @@ class ColModelTrainingConfig:
                 len(g) == 3 for g in self.loss_func.mrl_groups
             ), f"Invalid MRL groups: {self.loss_func.mrl_groups}"
             self.eval_mrl_groups = [[g[0], g[1]] for g in self.loss_func.mrl_groups]
+            # a mixed-budget loss is also evaluated on a mixed-budget index
+            if hasattr(self.loss_func, "mixed_budget_choices"):
+                self.eval_mrl_groups.append(
+                    [
+                        self.loss_func.mixed_budget_query_tokens,
+                        list(self.loss_func.mixed_budget_choices),
+                    ]
+                )
 
         # Disable gradient checkpoint when FSDP is detected -- it will be taken over by FSDP
         if "ACCELERATE_USE_FSDP" in os.environ and os.environ[
