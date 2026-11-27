@@ -93,6 +93,12 @@ class MultiTokenModule(torch.nn.Module):
         scores[mask] *= self.filter_factor
 
 
+# The subclasses below reference `ColbertModule`, which is not defined in this file.
+# Alias it to MultiTokenModule so the module imports. `_apply_normalization` is still
+# missing, so `normalize_scores=True` is unsupported (7b_mrl.yaml uses False).
+ColbertModule = MultiTokenModule
+
+
 class NewColbertLoss(ColbertModule):
     """
     InfoNCE loss for late interaction (ColBERT) without explicit negatives.

@@ -51,7 +51,8 @@ config:
     (): colpali_engine.loss.late_interaction_losses.ColbertInBatchNegativeLoss
     normalize_scores: false
     temperature: 0.03
-    mrl_groups: [ [1, 1, 1.0], [2, 4, 1.0], [4, 8, 1.0], [8, 16, 1.0], [16, 64, 1.0], ]
+    # query fixed at 16 Meta Tokens; MMR only over doc tokens (same doc budgets as the paper: 1, 4, 8, 16, 64)
+    mrl_groups: [ [16, 1, 1.0], [16, 4, 1.0], [16, 8, 1.0], [16, 16, 1.0], [16, 64, 1.0] ]
 
   tr_args:
     (): transformers.training_args.TrainingArguments
