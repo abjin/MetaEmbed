@@ -63,6 +63,8 @@ GPUS=4,5,6,7 FSDP_CONFIG=fsdp_4gpu.yaml scripts/train/run_vdr.sh scripts/3b_mrl_
 - `vidore_eval_frequency`는 `eval_steps`의 배수여야 한다.
 - MoCa 원본 tar에 0바이트 이미지가 1장 있다(`colpali_tevatron/colpali_96.jpg`). 변환 스크립트가 PIL로 열리지 않는 이미지가 든 행을
   버리므로(`tevatron_colpali` 1행) 변환 결과를 그대로 쓰면 된다. 예전 변환본을 쓰면 학습 중 DataLoader가 죽는다.
+- **데이터를 다시 변환했으면 `~/.cache/huggingface/datasets/mo_ca_train_with_image`를 지워야 한다.** 안 지우면 `load_dataset`이
+  예전 arrow 캐시를 그대로 읽는다. 로그의 `total num rows=240746 with [118094, 122652]`로 확인한다(학습용, subset당 평가용 100행 제외).
 - 장당 64에서 7B는 GPU 메모리 최대 75.6GB/80GB(평가 포함)까지 쓴다. `expandable_segments`를 켜고 돌린다.
 - **rpower4에서는 GPU 3번을 쓰지 않는다.** `nvidia-smi topo -m` 기준 0–3번과 4–7번이 서로 다른 PCIe 스위치·CPU 소켓(SYS)에 있고,
   3번은 다른 사용자가 쓰는 0–2번과 스위치를 나눠 쓴다. 3–7번 5장으로 돌린 두 번(7B, 3B) 모두 step당 시간이
@@ -77,7 +79,8 @@ GPUS=4,5,6,7 FSDP_CONFIG=fsdp_4gpu.yaml scripts/train/run_vdr.sh scripts/3b_mrl_
 | 2026-11-27 | 7B, GPU 5장 × 64, 본 학습 | 41/750 step에서 중단(3B 먼저 하기로 함). loss 10.98 → 2.25 (10 step 평균) |
 | 2026-11-27 | 3B, GPU 5장 × 64, 20 step 테스트 | 31초/step(16–20 step은 120–140초로 느려짐), 메모리 41.4GB. step 20 tabfquad nDCG@5: 1토큰 0.567 / 4: 0.579 / 8: 0.590 / 16: 0.576 / 64: 0.544 |
 | 2026-11-27 | 3B, GPU 4장(4–7) × 80, 본 학습 | 28 step에서 중단: 0바이트 이미지(`colpali_tevatron/colpali_96.jpg`) 디코딩 실패. 35.5초/step, 메모리 50.8GB |
-| 2026-11-27 | 3B, GPU 4장(4–7) × 80, 본 학습 (데이터 재생성 후 재시작) | 진행 중 |
+| 2026-11-27 | 3B, 데이터 재생성 후 재시작 | 3 step에서 중단: HF datasets 캐시에 남은 예전 데이터를 읽고 있었음 |
+| 2026-11-27 | 3B, GPU 4장(4–7) × 80, 본 학습 (캐시 삭제 후 재시작) | 진행 중 |
 
 초반에는 MMR 그룹 5개의 loss가 거의 같게 움직인다. 학습이 진행되면서 문서 64토큰 그룹이 1토큰 그룹보다
 앞서는지(Meta Token이 실제로 다른 정보를 나눠 담는지)를 계속 확인해야 한다.
