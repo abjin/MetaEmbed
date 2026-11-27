@@ -1,0 +1,18 @@
+# eval_dataset_loader_v2 (ViDoRe v2): HF dataset ids, resolved from the local HF cache.
+# Only the 4 datasets published on HF are listed. The English-only `*_eng_v2` variants
+# used in test_data_mast_v2.yaml are derived locally upstream and are not on HF.
+esg_reports_human_labeled_v2:  # english only
+  (): colpali_engine.utils.dataset_transformation.TestSetFactoryBEIR
+  dataset_path: vidore/esg_reports_human_labeled_v2
+
+esg_reports_v2_multilingual:
+  (): colpali_engine.utils.dataset_transformation.TestSetFactoryBEIR
+  dataset_path: vidore/esg_reports_v2
+
+biomedical_lectures_v2_multilingual:
+  (): colpali_engine.utils.dataset_transformation.TestSetFactoryBEIR
+  dataset_path: vidore/biomedical_lectures_v2
+
+economics_reports_v2_multilingual:
+  (): colpali_engine.utils.dataset_transformation.TestSetFactoryBEIR
+  dataset_path: vidore/economics_reports_v2

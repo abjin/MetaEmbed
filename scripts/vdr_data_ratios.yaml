@@ -1,0 +1,4 @@
+# VDR-only training mix: the two text -> document-image subsets of MoCa-CL-Pairs, sampled 50/50.
+# Built by scripts/data/prepare_moca_vdr.py into $DATA_DIR/MoCa_train_with_image.
+tevatron_colpali: {"weight": 5.0, "num_samples": 999999}
+visrag_ind: {"weight": 5.0, "num_samples": 999999}
