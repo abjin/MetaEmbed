@@ -23,10 +23,12 @@ Usage:
 
 import argparse
 import ast
+import functools
 import os
 
 import pyarrow.parquet as pq
 from datasets import Dataset, Features, Image, Sequence, Value
+from PIL import Image as PILImage
 
 DS_NAME = "MoCa_train_with_image"
 FEATURES = Features(
@@ -51,11 +53,25 @@ def parse_list(value):
     return parsed if isinstance(parsed, list) else [parsed]
 
 
+@functools.lru_cache(maxsize=None)
+def is_readable_image(path):
+    # MoCa ships at least one 0-byte jpg (colpali_tevatron/colpali_96.jpg); it crashes the
+    # DataLoader worker at decode time, so rows pointing at unreadable files are dropped here.
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        with PILImage.open(path) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+
+
 def to_image(raw_dir, rel_path, missing):
     if not rel_path:
         return None
     path = os.path.join(raw_dir, rel_path)
-    if not os.path.isfile(path):
+    if not is_readable_image(path):
         missing.append(path)
         return False
     return {"path": path, "bytes": None}
@@ -95,7 +111,7 @@ def convert_subset(raw_dir, out_dir, subset, rows_per_file):
         )
     print(
         f"{subset}: {len(rows)} rows in, {len(ds)} rows out, {dropped} dropped "
-        f"({len(missing)} missing image files{', e.g. ' + missing[0] if missing else ''})"
+        f"({len(missing)} missing or unreadable image files{', e.g. ' + missing[0] if missing else ''})"
     )
 
 
