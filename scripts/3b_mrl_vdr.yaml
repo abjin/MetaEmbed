@@ -1,5 +1,6 @@
 # VDR-only run on the 3B base: same as 7b_mrl_vdr.yaml except the base model.
-# tevatron_colpali + visrag_ind, query fixed at 16 Meta Tokens, 5 GPUs x 64 = 320.
+# tevatron_colpali + visrag_ind, query fixed at 16 Meta Tokens, 4 GPUs x 80 = 320 (same global batch).
+# GPU 3 is left out on rpower4: it shares a PCIe switch with other users' GPUs 0-2 and crosses sockets to 4-7.
 config:
   (): colpali_engine.trainer.colmodel_training.ColModelTrainingConfig
   output_dir: !path ./output/lastqwen2.5-3b-vdr-qfix16-mmr-bs320
@@ -28,7 +29,7 @@ config:
     (): colpali_engine.utils.mm_dataset_transformation.InterleavedDataset
     subset2meta: !import ./vdr_data_ratios.yaml
     is_mast: true
-    num_shards: 160  # divisible by world_size (5) x dataloader workers (4); will be divided by world_size to serve the real number of shards per GPU
+    num_shards: 160  # divisible by world_size (4 or 5) x dataloader workers (4); will be divided by world_size to serve the real number of shards per GPU
     interleaved_batch_size: 32
     stopping_strategy: "all_exhausted"
 
@@ -60,7 +61,7 @@ config:
     output_dir: null
     overwrite_output_dir: true
     num_train_epochs: 5
-    per_device_train_batch_size: 64
+    per_device_train_batch_size: 80
     gradient_checkpointing: true
     gradient_checkpointing_kwargs: { "use_reentrant": false }
     per_device_eval_batch_size: 48

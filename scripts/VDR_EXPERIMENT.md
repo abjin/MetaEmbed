@@ -12,14 +12,14 @@ MetaEmbed를 문서 이미지 검색(VDR) 데이터만으로 학습하고, 쿼�
 | 모델 | Qwen2.5-VL-3B / 7B-Instruct + processor `vidore/colqwen2.5-base`, Meta Token 16/64, dim -1 |
 | LoRA | r 32, alpha 32, dropout 0.1, LLM의 attention/MLP proj만 (transformers 4.51.3 기준 7B 81.0M = 0.97%) |
 | 최적화 | lr 1e-4, warmup 40 step, τ 0.03, `do_gather: true` (전 GPU 배치를 negative로 사용) |
-| 배치 | GPU 5장(3–7번) × 64 = 320, 1 epoch = 750 step |
+| 배치 | 전체 320, 1 epoch = 750 step. 3B: GPU 4장(4–7번) × 80 / 7B: GPU 5장(3–7번) × 64 |
 | 평가 | 150 step마다 ViDoRe v1 10개(`mteb/*_beir`) + v2 4개(`vidore/*_v2`), MMEB 끔 |
 
 논문(배치 1,536, MMEB+ViDoRe 데이터, 약 4.5 epoch)과 다른 점은 의도된 것이다.
 
 ## 파일
 
-- `scripts/7b_mrl_vdr.yaml`, `scripts/3b_mrl_vdr.yaml`: 학습 설정 (베이스 모델과 출력 폴더만 다름)
+- `scripts/7b_mrl_vdr.yaml`, `scripts/3b_mrl_vdr.yaml`: 학습 설정 (베이스 모델, 출력 폴더, 장당 배치만 다름)
 - `scripts/vdr_data_ratios.yaml`: 학습 subset과 비율
 - `scripts/data/prepare_moca_vdr.py`: MoCa parquet → 학습 로더 형식 변환
 - `scripts/data/test_data_vidore_beir_hf.yaml`, `scripts/data/test_data_vidore_v2_hf.yaml`: HF id 기반 평가셋
@@ -42,9 +42,9 @@ uv pip install --python .venv/bin/python -r requirements-vdr-lock.txt \
   --out-dir /home/gijin/sample-adaptive-embedding/data_dir
 #    이미지 컬럼은 절대경로만 저장하므로 raw 폴더 위치를 바꾸면 다시 변환해야 한다.
 
-# 3) 학습 (GPU 3–7, 로그는 ../runs/<config>.log)
-scripts/train/run_vdr.sh scripts/3b_mrl_vdr.yaml
-#    GPU 4장이면: GPUS=4,5,6,7 FSDP_CONFIG=fsdp_4gpu.yaml, 이때 num_shards는 4×4로 나누어떨어져야 한다.
+# 3) 학습 (로그는 ../runs/<config>.log, 체크포인트와 평가 json은 scripts/output/<output_dir>/)
+GPUS=4,5,6,7 FSDP_CONFIG=fsdp_4gpu.yaml scripts/train/run_vdr.sh scripts/3b_mrl_vdr.yaml
+#    기본값은 GPU 3–7 + fsdp_5gpu.yaml. num_shards는 GPU 수 × 4(worker)로 나누어떨어져야 한다.
 ```
 
 ## 코드 수정 (원본 대비)
@@ -62,8 +62,9 @@ scripts/train/run_vdr.sh scripts/3b_mrl_vdr.yaml
   안 그러면 `split_dataset_by_node`가 샤드 분할 대신 예제 건너뛰기로 동작해 GPU 간 데이터가 겹친다.
 - `vidore_eval_frequency`는 `eval_steps`의 배수여야 한다.
 - 장당 64에서 7B는 GPU 메모리 최대 75.6GB/80GB(평가 포함)까지 쓴다. `expandable_segments`를 켜고 돌린다.
-- rpower4에서 GPU 3번은 4–7번과 다른 CPU 소켓에 있어, 5장으로 돌리면 4장보다 step당 시간이 늘어난다(7B 48초 → 56초).
-- 디스크 IO가 몰리면 데이터 로딩이 밀려 step당 시간이 2–5배로 늘어나는 구간이 있었다(7B 11–31 step).
+- **rpower4에서는 GPU 3번을 쓰지 않는다.** `nvidia-smi topo -m` 기준 0–3번과 4–7번이 서로 다른 PCIe 스위치·CPU 소켓(SYS)에 있고,
+  3번은 다른 사용자가 쓰는 0–2번과 스위치를 나눠 쓴다. 3–7번 5장으로 돌린 두 번(7B, 3B) 모두 step당 시간이
+  2–5배로 늘어나는 구간이 나왔고(GPU 사용률은 100%, 통신 대기로 추정), 4–7번 4장에서는 나오지 않았다.
 
 ## 실행 기록 (rpower4, A100 80GB)
 
@@ -72,7 +73,8 @@ scripts/train/run_vdr.sh scripts/3b_mrl_vdr.yaml
 | 2026-11-27 | 7B, GPU 4장 × 48, 50 step 테스트 (25 step에서 중단) | 37.3초/step, 메모리 59.8GB. step 25 tabfquad nDCG@5: 1토큰 0.673 / 4: 0.671 / 8: 0.665 / 16: 0.659 / 64: 0.655 |
 | 2026-11-27 | 7B, GPU 4장 × 64, 20 step 테스트 | 48.3초/step, 메모리 75.6GB, 평가·체크포인트 저장 정상 |
 | 2026-11-27 | 7B, GPU 5장 × 64, 본 학습 | 41/750 step에서 중단(3B 먼저 하기로 함). loss 10.98 → 2.25 (10 step 평균) |
-| 2026-11-27 | 3B, GPU 5장 × 64 | 진행 중 |
+| 2026-11-27 | 3B, GPU 5장 × 64, 20 step 테스트 | 31초/step(16–20 step은 120–140초로 느려짐), 메모리 41.4GB. step 20 tabfquad nDCG@5: 1토큰 0.567 / 4: 0.579 / 8: 0.590 / 16: 0.576 / 64: 0.544 |
+| 2026-11-27 | 3B, GPU 4장(4–7) × 80, 본 학습 | 진행 중. 35.5초/step, 메모리 50.8GB |
 
 초반에는 MMR 그룹 5개의 loss가 거의 같게 움직인다. 학습이 진행되면서 문서 64토큰 그룹이 1토큰 그룹보다
 앞서는지(Meta Token이 실제로 다른 정보를 나눠 담는지)를 계속 확인해야 한다.
