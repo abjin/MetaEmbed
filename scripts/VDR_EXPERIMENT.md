@@ -117,7 +117,9 @@ GPUS=4,5,6,7 FSDP_CONFIG=fsdp_4gpu.yaml scripts/train/run_vdr.sh scripts/3b_mrl_
   - 1·4토큰은 좋아졌다.
   - 8토큰 이상은 나빠졌다. 64토큰은 0.883 → 0.870이고, 특히 tatdqa(0.761 → 0.727)와 shift_project(0.885 → 0.827)에서 크게 떨어졌다.
   - v2(다국어 3개 포함)는 모든 토큰 수에서 좋아졌다.
-- 다음 후보: 혼합 로스 비중을 줄여 64토큰 손실을 줄이는지 본다(`group` 모드 또는 w=0.5).
+- `add`, w=1.0이면 새 로스가 전체 로스의 50%를 차지한다(MMR 그룹 하나는 10%).
+  다음 실험은 MMR 쪽 세기는 그대로 두고 새 로스 가중치만 0.5(33%), 0.2(17%)로 낮춰,
+  64토큰 손실은 줄이면서 혼합 색인 안정성은 유지되는지 본다.
 
 ## 실행 기록 (rpower4, A100 80GB)
 
@@ -134,6 +136,7 @@ GPUS=4,5,6,7 FSDP_CONFIG=fsdp_4gpu.yaml scripts/train/run_vdr.sh scripts/3b_mrl_
 | 2026-11-27 | 기준 checkpoint-150, `eval_checkpoints.py` 테스트(tabfquad) | nDCG@5 1토큰 0.854 / 4: 0.853 / 8: 0.864 / 16: 0.884 / 64: 0.883 / 혼합 0.851 |
 | 2026-11-27–28 | 3B + 혼합 토큰 수 로스 본 학습 (`add`, w=1.0) | 완료(학습 9시간 12분). 결과는 위 "결과" 표 |
 | 2026-11-27–28 | 두 모델 체크포인트 5개씩 `eval_checkpoints.py` 평가 (GPU 3번) | 완료. 체크포인트당 약 30분 |
+| 2026-11-28 | 3B + 혼합 로스 `add`, w=0.5 → w=0.2 (`3b_mrl_vdr_mixed_w05.yaml`, `_w02.yaml`) | 진행 중. `runs/queue_mixed_weights.sh`가 차례로 실행하고, 끝난 실험의 체크포인트는 GPU 3번에서 `eval_checkpoints.py`로 평가 |
 
 초반에는 MMR 그룹 5개의 loss가 거의 같게 움직였지만, step 150 평가에서는 토큰 수가 늘수록 nDCG가 꾸준히 올랐다(v1 평균 0.778 → 0.825).
 Meta Token들이 서로 다른 정보를 나눠 담고 있다는 뜻으로 보인다. 다국어 v2에서는 차이가 작다.

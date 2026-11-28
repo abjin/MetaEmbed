@@ -1,0 +1,100 @@
+# 3B VDR run with an extra mixed-budget loss at weight 0.2 (3b_mrl_vdr_mixed.yaml uses 1.0).
+# Every step each candidate doc draws its own doc budget r_c from {1,4,8,16,64}; see
+# ColbertInBatchNegativeMixedBudgetLoss in colpali_engine/loss/late_interaction_losses.py.
+# tevatron_colpali + visrag_ind, query fixed at 16 Meta Tokens, 4 GPUs x 80 = 320 (same global batch).
+# GPU 3 is left out on rpower4: it shares a PCIe switch with other users' GPUs 0-2 and crosses sockets to 4-7.
+config:
+  (): colpali_engine.trainer.colmodel_training.ColModelTrainingConfig
+  output_dir: !path ./output/lastqwen2.5-3b-vdr-qfix16-mmr-mixed-w02-bs320
+  processor:
+    (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
+    class_to_instantiate: !ext colpali_engine.models.qwen2_5.colqwen2_5.mm_processing_colqwen2_5.MultimodalColQwen2_5_Processor
+    pretrained_model_name_or_path: "vidore/colqwen2.5-base"
+    max_num_visual_tokens: 1024
+    use_simple_prompt: true
+    truncation_len: 16384
+
+  model:
+    (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
+    class_to_instantiate: !ext colpali_engine.models.LastQwen2_5
+    pretrained_model_name_or_path: "Qwen/Qwen2.5-VL-3B-Instruct"
+    torch_dtype:  !ext torch.bfloat16
+    use_cache: false
+    attn_implementation: "flash_attention_2"
+    use_liger_kernel: true
+    dim: -1
+    num_query_prompt_tokens: 16
+    num_doc_prompt_tokens: 64
+    shared_query_doc_prompt: false
+
+  dataset_loading_cls:
+    (): colpali_engine.utils.mm_dataset_transformation.InterleavedDataset
+    subset2meta: !import ./vdr_data_ratios.yaml
+    is_mast: true
+    num_shards: 160  # divisible by world_size (4 or 5) x dataloader workers (4); will be divided by world_size to serve the real number of shards per GPU
+    interleaved_batch_size: 32
+    stopping_strategy: "all_exhausted"
+
+  wandb_project: "MetaEmbed"
+
+  eval_dataset_loader: !import ./data/test_data_vidore_beir_hf.yaml
+  eval_dataset_loader_v2: !import ./data/test_data_vidore_v2_hf.yaml
+  no_eval_keywords: []
+  vidore_eval_frequency: 150    # note this has to be divided by `eval_steps` in tr_args
+  eval_dataset_format: "beir"
+
+  use_mm_collator: true
+  use_v2_trainer: true
+  use_v2_retriever: true
+  num_negative: 1
+
+  run_eval: true
+  do_gather: true
+
+  loss_func:
+    (): colpali_engine.loss.late_interaction_losses.ColbertInBatchNegativeMixedBudgetLoss
+    normalize_scores: false
+    temperature: 0.03
+    # query fixed at 16 Meta Tokens; MMR only over doc tokens (same doc budgets as the paper: 1, 4, 8, 16, 64)
+    mrl_groups: [ [16, 1, 1.0], [16, 4, 1.0], [16, 8, 1.0], [16, 16, 1.0], [16, 64, 1.0] ]
+    # extra term: per-candidate doc budget r_c ~ Uniform{1,4,8,16,64}, query fixed at 16 tokens
+    mixed_budget_choices: [1, 4, 8, 16, 64]
+    mixed_budget_query_tokens: 16
+    mixed_budget_mode: "add"   # "add": mean(MMR) + w * mixed | "group": (sum MMR + w * mixed) / 6
+    mixed_budget_weight: 0.2
+    mixed_budget_seed: 0
+    # eval adds mrl_16_mixed (each doc indexed with its own fixed-seed budget) automatically
+
+  tr_args:
+    (): transformers.training_args.TrainingArguments
+    output_dir: null
+    overwrite_output_dir: true
+    num_train_epochs: 5
+    per_device_train_batch_size: 80
+    gradient_checkpointing: true
+    gradient_checkpointing_kwargs: { "use_reentrant": false }
+    per_device_eval_batch_size: 48
+    eval_strategy: "steps"
+    dataloader_num_workers: 4
+    save_steps: 150
+    logging_steps: 10
+    eval_steps: 150
+    warmup_steps: 40
+    learning_rate: 1e-4
+    save_total_limit: 32
+    resume_from_checkpoint: true
+    report_to: "none"  # wandb is not logged in on rpower4
+    ddp_find_unused_parameters: false
+    # as we are using an Iterable dataset, max_steps is needed
+    max_steps: 750  # ~1 epoch: (118,095 + 122,452) / 320
+
+  peft_config:
+    (): peft.LoraConfig
+    r: 32
+    lora_alpha: 32
+    lora_dropout: 0.1
+    init_lora_weights: "gaussian"
+    bias: "none"
+    task_type: "FEATURE_EXTRACTION"
+    target_modules: '(.*(model).*(down_proj|gate_proj|up_proj|k_proj|q_proj|v_proj|o_proj).*$)'
+    modules_to_save: ['prompt_embed_tokens', 'custom_text_proj']
